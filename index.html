@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Magic Christmas Tree - Mobile AR</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+        
+        /* 3D Canvas */
+        #canvas-container { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; }
+        
+        /* Hidden Video Processing */
+        #video-input { position: absolute; visibility: hidden; width: 1px; height: 1px; }
+
+        /* UI Overlay */
+        #ui-layer { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 10; pointer-events: none; display: flex; flex-direction: column; justify-content: space-between; padding: 20px; box-sizing: border-box; }
+        
+        .header { text-align: center; margin-top: 10px; text-shadow: 0 0 10px rgba(255,215,0,0.5); }
+        h1 { color: #fff; font-size: 1.2rem; margin: 0; letter-spacing: 2px; font-weight: 300; }
+        .status { color: #ffd700; font-size: 0.8rem; margin-top: 5px; opacity: 0.8; }
+
+        /* Start Screen (Required for Mobile) */
+        #start-screen {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.9); z-index: 50;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            pointer-events: auto;
+            transition: opacity 0.5s;
+        }
+        #start-btn {
+            background: linear-gradient(45deg, #D42426, #800000);
+            color: #fff; border: 2px solid #ffd700; padding: 15px 40px;
+            font-size: 1.2rem; border-radius: 30px; cursor: pointer;
+            box-shadow: 0 0 20px rgba(255, 215, 0, 0.4);
+            text-transform: uppercase; letter-spacing: 1px;
+        }
+
+        /* Controls Bottom */
+        .controls { pointer-events: auto; display: flex; gap: 10px; overflow-x: auto; padding-bottom: 10px; -webkit-overflow-scrolling: touch; }
+        .btn-action {
+            background: rgba(255,255,255,0.1); border: 1px solid rgba(255,215,0,0.3);
+            color: #eee; padding: 8px 15px; border-radius: 20px; font-size: 0.8rem;
+            white-space: nowrap; backdrop-filter: blur(5px);
+        }
+        
+        /* Loading Indicator */
+        #loading-text { margin-top: 20px; color: #888; font-size: 0.9rem; }
+    </style>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+                "@mediapipe/hands": "https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js",
+                "@mediapipe/camera_utils": "https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js",
+                "gsap": "https://unpkg.com/gsap@3.12.5/index.js"
+            }
+        }
+    </script>
+</head>
+<body>
+
+    <!-- Start Screen for Mobile Permissions -->
+    <div id="start-screen">
+        <button id="start-btn">开启圣诞魔法</button>
+        <div id="loading-text">需允许摄像头权限以捕捉手势</div>
+    </div>
+
+    <!-- Video Element (Playsinline is crucial for iOS) -->
+    <video id="video-input" playsinline></video>
+
+    <div id="canvas-container"></div>
+
+    <div id="ui-layer">
+        <div class="header">
+            <h1>MERRY CHRISTMAS</h1>
+            <div class="status" id="status-text">等待启动...</div>
+        </div>
+        
+        <div class="controls">
+            <button class="btn-action" id="upload-btn">📷 上传照片</button>
+            <input type="file" id="file-input" style="display:none" accept="image/*">
+            <!-- Fallback controls for when hand tracking is difficult on mobile -->
+            <button class="btn-action" onclick="window.triggerState('TREE')">🎄 聚合</button>
+            <button class="btn-action" onclick="window.triggerState('SCATTER')">✨ 散开</button>
+        </div>
+    </div>
+
+    <!-- Shaders -->
+    <script type="x-shader/x-vertex" id="vertexshader">
+        attribute float size;
+        attribute float speed;
+        attribute vec3 customColor;
+        varying vec3 vColor;
+        varying float vOpacity;
+        uniform float uTime;
+        
+        void main() {
+            vColor = customColor;
+            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+            
+            // Simple twinkle effect based on time and random speed
+            float blink = sin(uTime * speed + position.x * 10.0);
+            vOpacity = 0.5 + 0.5 * blink; 
+
+            gl_PointSize = size * (300.0 / -mvPosition.z) * vOpacity;
+            gl_Position = projectionMatrix * mvPosition;
+        }
+    </script>
+
+    <script type="x-shader/x-fragment" id="fragmentshader">
+        uniform sampler2D pointTexture;
+        varying vec3 vColor;
+        varying float vOpacity;
+
+        void main() {
+            // Draw a soft circular glow manually to avoid external texture dependencies if needed, 
+            // but here we simulate a spark.
+            vec2 xy = gl_PointCoord.xy - vec2(0.5);
+            float ll = length(xy);
+            if (ll > 0.5) discard;
+            
+            // Core bloom
+            float strength = 1.0 - (ll * 2.0);
+            strength = pow(strength, 3.0); 
+
+            gl_FragColor = vec4(vColor, strength * vOpacity);
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import gsap from 'gsap';
+
+        // ================= STATE & CONFIG =================
+        const state = {
+            current: 'SCATTER', // Start scattered
+            particles: [],
+            photos: [],
+            time: 0,
+            handDetected: false
+        };
+
+        const CONFIG = {
+            particleCount: 1500, // Increased for mobile density
+            photoCount: 6,
+            colors: [0x2F5A3D, 0xD42426, 0xFFD700, 0xFFFFFF], // Green, Red, Gold, White
+            treeHeight: 30,
+            treeRadius: 12
+        };
+
+        // ================= THREE.JS INIT =================
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x000000, 0.02); // Darker fog
+
+        const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 0, 45);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // Limit pixel ratio for mobile performance
+        container.appendChild(renderer.domElement);
+
+        // Post Processing (Essential for "Exquisite" Glow)
+        const composer = new EffectComposer(renderer);
+        const renderPass = new RenderPass(scene, camera);
+        const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
+        bloomPass.threshold = 0.1;
+        bloomPass.strength = 1.2; // Shiny!
+        bloomPass.radius = 0.5;
+        composer.addPass(renderPass);
+        composer.addPass(bloomPass);
+
+        // ================= PARTICLE SYSTEM (SHADER BASED) =================
+        // We use Points with ShaderMaterial for high performance "Glitter"
+        const geometry = new THREE.BufferGeometry();
+        const positions = [];
+        const colors = [];
+        const sizes = [];
+        const speeds = [];
+        
+        const colorPalette = CONFIG.colors.map(c => new THREE.Color(c));
+
+        // Data structure to hold targets
+        const targets = {
+            tree: [],
+            scatter: []
+        };
+
+        for (let i = 0; i < CONFIG.particleCount; i++) {
+            // 1. Scatter Position (Random Universe)
+            const sx = (Math.random() - 0.5) * 80;
+            const sy = (Math.random() - 0.5) * 80;
+            const sz = (Math.random() - 0.5) * 50;
+            targets.scatter.push(sx, sy, sz);
+            
+            // Current Position (Start at scatter)
+            positions.push(sx, sy, sz);
+
+            // 2. Tree Position (Volumetric Cone)
+            // Use sqrt(random) for even distribution inside a circle slice
+            const heightPercent = Math.random(); 
+            const y = (heightPercent * CONFIG.treeHeight) - (CONFIG.treeHeight / 2);
+            
+            const maxR = CONFIG.treeRadius * (1 - heightPercent); // Cone tapers
+            const r = maxR * Math.sqrt(Math.random()); // Volumetric fill
+            const theta = Math.random() * Math.PI * 2;
+            
+            const tx = r * Math.cos(theta);
+            const tz = r * Math.sin(theta);
+            targets.tree.push(tx, y, tz);
+
+            // Attributes
+            const color = colorPalette[Math.floor(Math.random() * colorPalette.length)];
+            colors.push(color.r, color.g, color.b);
+            sizes.push(Math.random() * 0.8 + 0.2);
+            speeds.push(Math.random() * 5.0 + 1.0); // Sparkle speed
+        }
+
+        geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+        geometry.setAttribute('customColor', new THREE.Float32BufferAttribute(colors, 3));
+        geometry.setAttribute('size', new THREE.Float32BufferAttribute(sizes, 1));
+        geometry.setAttribute('speed', new THREE.Float32BufferAttribute(speeds, 1));
+
+        const material = new THREE.ShaderMaterial({
+            uniforms: {
+                uTime: { value: 0 },
+                pointTexture: { value: new THREE.TextureLoader().load('https://threejs.org/examples/textures/sprites/spark1.png') }
+            },
+            vertexShader: document.getElementById('vertexshader').textContent,
+            fragmentShader: document.getElementById('fragmentshader').textContent,
+            blending: THREE.AdditiveBlending,
+            depthTest: false,
+            transparent: true
+        });
+
+        const particleSystem = new THREE.Points(geometry, material);
+        scene.add(particleSystem);
+
+        // ================= PHOTOS =================
+        const photoGroup = new THREE.Group();
+        scene.add(photoGroup);
+
+        function addPhoto(index) {
+            const geo = new THREE.PlaneGeometry(4, 3);
+            const mat = new THREE.MeshBasicMaterial({ 
+                color: 0x222222, 
+                side: THREE.DoubleSide,
+                transparent: true, opacity: 0.8
+            });
+            const mesh = new THREE.Mesh(geo, mat);
+            
+            // Tree position (Outer shell of cone)
+            const hPct = index / CONFIG.photoCount;
+            const y = (hPct * CONFIG.treeHeight) - (CONFIG.treeHeight/2) + 2;
+            const r = (CONFIG.treeRadius * (1 - hPct)) + 1; // Slightly outside
+            const theta = index * (Math.PI * 2 / 3); // Spiral around
+            
+            mesh.userData = {
+                treePos: new THREE.Vector3(r * Math.cos(theta), y, r * Math.sin(theta)),
+                scatterPos: new THREE.Vector3((Math.random()-0.5)*40, (Math.random()-0.5)*40, (Math.random()-0.5)*20)
+            };
+            
+            // Initial Pos
+            mesh.position.copy(mesh.userData.scatterPos);
+            mesh.lookAt(camera.position); // Always face camera initially
+            
+            photoGroup.add(mesh);
+            state.photos.push(mesh);
+            
+            // Add border
+            const border = new THREE.LineSegments(
+                new THREE.EdgesGeometry(geo),
+                new THREE.LineBasicMaterial({ color: 0xffd700 })
+            );
+            mesh.add(border);
+        }
+        
+        for(let i=0; i<CONFIG.photoCount; i++) addPhoto(i);
+
+        // ================= ANIMATION & LOGIC =================
+
+        // Global function for buttons
+        window.triggerState = (newState) => {
+            if (state.current === newState) return;
+            state.current = newState;
+            
+            const statusEl = document.getElementById('status-text');
+            statusEl.innerText = newState === 'TREE' ? "状态: 🎄 圣诞树聚合" : "状态: ✨ 星尘散落";
+            statusEl.style.color = newState === 'TREE' ? "#5f5" : "#fd5";
+
+            // Animate Particles
+            const posAttr = particleSystem.geometry.attributes.position;
+            const targetArr = newState === 'TREE' ? targets.tree : targets.scatter;
+
+            // Using GSAP to animate raw buffer data is heavy, so we use a custom lerp in render loop
+            // But for distinct state change, let's use a simpler tween on a 'blend' factor
+            gsap.to(state, {
+                duration: 2.0,
+                ease: "power3.inOut",
+                onUpdate: () => {
+                    // Manual interpolation
+                    // Ideally we do this in Vertex Shader for performance, but JS is easier to prototype logic
+                    // We'll create a transition object
+                }
+            });
+            
+            // Re-trigger particle tweening logic
+            state.transitionStartTime = performance.now();
+            state.transitionDuration = 2000;
+            state.startPositions = Float32Array.from(posAttr.array);
+            state.targetPositions = targetArr;
+            state.isTransitioning = true;
+
+            // Animate Photos
+            state.photos.forEach(photo => {
+                const t = newState === 'TREE' ? photo.userData.treePos : photo.userData.scatterPos;
+                gsap.to(photo.position, {
+                    x: t.x, y: t.y, z: t.z,
+                    duration: 1.5,
+                    ease: "back.out(1.2)"
+                });
+                
+                if (newState === 'TREE') {
+                    // Make photos face outward from center
+                    const lookAtTarget = new THREE.Vector3(t.x*2, t.y, t.z*2);
+                    const dummy = new THREE.Object3D();
+                    dummy.position.copy(t);
+                    dummy.lookAt(lookAtTarget);
+                    gsap.to(photo.quaternion, {
+                        x: dummy.quaternion.x, y: dummy.quaternion.y, z: dummy.quaternion.z, w: dummy.quaternion.w,
+                        duration: 1.5
+                    });
+                } else {
+                    gsap.to(photo.rotation, {
+                        x: Math.random(), y: Math.random(), z: Math.random(),
+                        duration: 1.5
+                    });
+                }
+            });
+        };
+
+        // ================= MEDIAPIPE HANDS (MOBILE OPTIMIZED) =================
+        async function startApp() {
+            document.getElementById('start-screen').style.opacity = 0;
+            setTimeout(() => document.getElementById('start-screen').remove(), 500);
+
+            const videoElement = document.getElementById('video-input');
+            const { Hands } = window;
+            const { Camera } = window;
+
+            if (!Hands) {
+                alert("组件加载失败，请检查网络");
+                return;
+            }
+
+            const hands = new Hands({locateFile: (file) => {
+                return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+            }});
+
+            // Optimize for mobile
+            hands.setOptions({
+                maxNumHands: 1,
+                modelComplexity: 0, // Lite model for mobile speed
+                minDetectionConfidence: 0.6,
+                minTrackingConfidence: 0.6
+            });
+
+            hands.onResults(onHandResults);
+
+            const cam = new Camera(videoElement, {
+                onFrame: async () => {
+                    await hands.send({image: videoElement});
+                },
+                width: 640,
+                height: 480,
+                facingMode: 'user' // Front camera
+            });
+            
+            try {
+                await cam.start();
+                document.getElementById('status-text').innerText = "视觉系统就绪 - 请展示手势";
+            } catch(e) {
+                console.error(e);
+                alert("无法启动摄像头，请使用下方按钮控制");
+            }
+        }
+
+        let lastGestureTime = 0;
+
+        function onHandResults(results) {
+            if (Date.now() - lastGestureTime < 500) return; // Debounce
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                const lm = results.multiHandLandmarks[0];
+                
+                // 1. Detect Open vs Fist
+                const wrist = lm[0];
+                const tipIds = [8, 12, 16, 20];
+                let extendedFingers = 0;
+
+                tipIds.forEach(id => {
+                    // If tip is higher (smaller y) than the middle joint
+                    if (distance(lm[id], wrist) > distance(lm[id-2], wrist) + 0.05) {
+                        extendedFingers++;
+                    }
+                });
+                
+                // Interaction Logic
+                if (extendedFingers >= 4) {
+                    // Open Palm
+                    if(state.current !== 'SCATTER') {
+                        window.triggerState('SCATTER');
+                        lastGestureTime = Date.now();
+                    }
+                    
+                    // Rotation mapping (X axis)
+                    const cx = lm[9].x; // Center of palm
+                    const rotSpeed = (cx - 0.5) * 0.1;
+                    scene.rotation.y += rotSpeed;
+
+                } else if (extendedFingers <= 1) {
+                    // Fist
+                    if(state.current !== 'TREE') {
+                        window.triggerState('TREE');
+                        lastGestureTime = Date.now();
+                    }
+                }
+            }
+        }
+
+        function distance(p1, p2) {
+            return Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
+        }
+
+        // ================= RENDER LOOP =================
+        function animate() {
+            requestAnimationFrame(animate);
+
+            state.time += 0.01;
+            material.uniforms.uTime.value = state.time;
+
+            // Manual Particle Interpolation
+            if (state.isTransitioning) {
+                const now = performance.now();
+                const progress = Math.min((now - state.transitionStartTime) / state.transitionDuration, 1);
+                const ease = 1 - Math.pow(1 - progress, 3); // Cubic Out
+
+                const positions = particleSystem.geometry.attributes.position.array;
+                
+                for (let i = 0; i < CONFIG.particleCount * 3; i++) {
+                    positions[i] = state.startPositions[i] + (state.targetPositions[i] - state.startPositions[i]) * ease;
+                }
+                
+                particleSystem.geometry.attributes.position.needsUpdate = true;
+                
+                if (progress >= 1) state.isTransitioning = false;
+            }
+
+            // Idle Animation
+            if (state.current === 'TREE' && !state.isTransitioning) {
+                scene.rotation.y += 0.002;
+            } else if (state.current === 'SCATTER') {
+                scene.rotation.y += 0.0005;
+            }
+
+            composer.render();
+        }
+
+        // ================= EVENTS =================
+        document.getElementById('start-btn').addEventListener('click', startApp);
+        
+        // File Upload Logic
+        const fileInput = document.getElementById('file-input');
+        const uploadBtn = document.getElementById('upload-btn');
+        
+        uploadBtn.addEventListener('click', () => fileInput.click());
+        
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files && e.target.files[0]) {
+                const reader = new FileReader();
+                reader.onload = function(evt) {
+                    const img = new Image();
+                    img.onload = () => {
+                        const tex = new THREE.Texture(img);
+                        tex.colorSpace = THREE.SRGBColorSpace;
+                        tex.needsUpdate = true;
+                        // Replace random photo
+                        const randomPhoto = state.photos[Math.floor(Math.random() * state.photos.length)];
+                        randomPhoto.material.map = tex;
+                        randomPhoto.material.color.setHex(0xffffff); // Remove tint
+                        randomPhoto.material.needsUpdate = true;
+                    };
+                    img.src = evt.target.result;
+                };
+                reader.readAsDataURL(e.target.files[0]);
+            }
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+
+    </script>
+</body>
+</html>
